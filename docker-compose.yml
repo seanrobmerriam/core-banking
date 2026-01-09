@@ -1,0 +1,51 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: core-banking-postgres
+    environment:
+      POSTGRES_USER: banking_user
+      POSTGRES_PASSWORD: secure_password
+      POSTGRES_DB: core_banking
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./.docker/postgres/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U banking_user -d core_banking"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - banking-network
+    restart: unless-stopped
+
+  nats:
+    image: nats:latest
+    container_name: core-banking-nats
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+    command:
+      - "-js"
+      - "-m"
+      - "8222"
+    healthcheck:
+      test: ["CMD", "nats", "-s", "localhost:4222", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - banking-network
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+    driver: local
+
+networks:
+  banking-network:
+    driver: bridge
