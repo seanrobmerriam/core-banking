@@ -17,6 +17,10 @@ import (
 	"github.com/core-banking/pkg/database"
 	"github.com/core-banking/pkg/logger"
 	"github.com/core-banking/pkg/middleware"
+
+	"github.com/core-banking/services/customer-service/internal/encryption"
+	customergrpc "github.com/core-banking/services/customer-service/internal/grpc"
+	"github.com/core-banking/services/customer-service/internal/repository"
 )
 
 func main() {
@@ -33,27 +37,61 @@ func main() {
 	log := logger.New(cfg.ServiceName)
 	log.Info().
 		Str("environment", cfg.Environment).
-		Int("port", cfg.ServerPort).
+		Int("http_port", cfg.ServerPort).
 		Msg("Starting customer service")
 
 	// Initialize database
-	Global.DB, err = database.NewDatabase(ctx, cfg.DatabaseConfig(), &log)
+	db, err := database.NewDatabase(ctx, cfg.DatabaseConfig(), &log)
 	if err != nil {
 		log.Fatal().Err(err).Msg("Failed to initialize database")
 	}
-	defer Global.DB.Close()
+	defer db.Close()
 
 	// Verify database health
-	if err := Global.DB.HealthCheck(ctx); err != nil {
+	if err := db.HealthCheck(ctx); err != nil {
 		log.Fatal().Err(err).Msg("Database health check failed")
 	}
 	log.Info().Msg("Database health check passed")
 
-	// Create router
-	router := createRouter(log)
+	// Initialize encryptor with key from environment or default
+	encryptionKey := os.Getenv("ENCRYPTION_KEY")
+	if encryptionKey == "" {
+		// Use a default key for development (32 bytes)
+		encryptionKey = "12345678901234567890123456789012"
+	}
+	encryptor, err := encryption.NewEncryptor(encryptionKey)
+	if err != nil {
+		log.Fatal().Err(err).Msg("Failed to initialize encryptor")
+	}
+
+	// Initialize repository
+	repo := repository.NewCustomerRepository(db.DB, encryptor)
+
+	// Start gRPC server
+	grpcPort := 50051 // Default gRPC port
+	grpcConfig := customergrpc.Config{
+		Port:        grpcPort,
+		MaxRecvSize: 100, // 100MB
+		MaxSendSize: 100, // 100MB
+		Timeout:     30 * time.Second,
+		EnableAuth:  false,
+	}
+
+	grpcServer := customergrpc.NewServer(repo, grpcConfig)
+
+	// Start gRPC server in goroutine
+	go func() {
+		log.Info().Int("port", grpcPort).Msg("Starting gRPC server")
+		if err := grpcServer.Start(); err != nil {
+			log.Fatal().Err(err).Msg("gRPC server failed to start")
+		}
+	}()
+
+	// Create HTTP router
+	router := createRouter(log, db)
 
 	// Create HTTP server
-	server := &http.Server{
+	httpServer := &http.Server{
 		Addr:         fmt.Sprintf("%s:%d", cfg.ServerHost, cfg.ServerPort),
 		Handler:      router,
 		ReadTimeout:  15 * time.Second,
@@ -61,13 +99,11 @@ func main() {
 		IdleTimeout:  60 * time.Second,
 	}
 
-	// Start server in goroutine
+	// Start HTTP server in goroutine
 	go func() {
-		log.Info().
-			Str("address", server.Addr).
-			Msg("Server starting")
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatal().Err(err).Msg("Server failed to start")
+		log.Info().Str("address", httpServer.Addr).Msg("Starting HTTP server")
+		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatal().Err(err).Msg("HTTP server failed to start")
 		}
 	}()
 
@@ -76,22 +112,25 @@ func main() {
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 
-	log.Info().Msg("Shutting down server gracefully...")
+	log.Info().Msg("Shutting down servers gracefully...")
 
 	// Create shutdown context with timeout
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	// Shutdown server
-	if err := server.Shutdown(shutdownCtx); err != nil {
-		log.Error().Err(err).Msg("Server forced to shutdown")
+	// Shutdown HTTP server
+	if err := httpServer.Shutdown(shutdownCtx); err != nil {
+		log.Error().Err(err).Msg("HTTP server forced to shutdown")
 	}
+
+	// Shutdown gRPC server
+	grpcServer.Stop()
 
 	log.Info().Msg("Server exited properly")
 }
 
 // createRouter creates the HTTP router with all middleware and routes.
-func createRouter(log zerolog.Logger) *chi.Mux {
+func createRouter(log zerolog.Logger, db *database.DB) *chi.Mux {
 	r := chi.NewRouter()
 
 	// Add middleware
@@ -103,7 +142,7 @@ func createRouter(log zerolog.Logger) *chi.Mux {
 	r.Use(middleware.JSONContentType)
 
 	// Health check endpoint (no authentication required)
-	r.Get("/health", healthHandler(log))
+	r.Get("/health", healthHandler(log, db))
 
 	// API routes
 	r.Route("/api/v1", func(r chi.Router) {
@@ -121,12 +160,12 @@ func createRouter(log zerolog.Logger) *chi.Mux {
 }
 
 // healthHandler returns the health status of the service.
-func healthHandler(log zerolog.Logger) http.HandlerFunc {
+func healthHandler(log zerolog.Logger, db *database.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
 
 		// Check database connectivity
-		status, err := Global.DB.Status(ctx)
+		status, err := db.Status(ctx)
 		if err != nil {
 			log.Error().Err(err).Msg("Database health check failed")
 			http.Error(w, "Database connection failed", http.StatusServiceUnavailable)
@@ -138,6 +177,7 @@ func healthHandler(log zerolog.Logger) http.HandlerFunc {
 			"status":    "healthy",
 			"service":   "customer-service",
 			"timestamp": time.Now().UTC().Format(time.RFC3339),
+			"protocols": []string{"http", "grpc"},
 			"database": map[string]interface{}{
 				"status":           status.Status,
 				"open_connections": status.OpenConnections,
@@ -155,7 +195,6 @@ func healthHandler(log zerolog.Logger) http.HandlerFunc {
 
 // listCustomersHandler returns a list of customers.
 func listCustomersHandler(w http.ResponseWriter, r *http.Request) {
-	// TODO: Implement actual database query
 	customers := []map[string]interface{}{
 		{
 			"id":         "1",
@@ -305,8 +344,3 @@ type updateCustomerRequest struct {
 func generateID() string {
 	return fmt.Sprintf("%d", time.Now().UnixNano())
 }
-
-// Global database instance for health check
-var Global = struct {
-	DB *database.DB
-}{}

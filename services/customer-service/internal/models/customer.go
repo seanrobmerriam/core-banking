@@ -158,6 +158,17 @@ type SearchFilters struct {
 	Offset    int            `json:"offset,omitempty"`
 }
 
+// StatusChange represents a customer status change record
+type StatusChange struct {
+	ID             uuid.UUID      `json:"id" db:"id"`
+	CustomerID     uuid.UUID      `json:"customer_id" db:"customer_id"`
+	PreviousStatus CustomerStatus `json:"previous_status" db:"previous_status"`
+	NewStatus      CustomerStatus `json:"new_status" db:"new_status"`
+	Reason         string         `json:"reason" db:"reason"`
+	ChangedBy      uuid.UUID      `json:"changed_by" db:"changed_by"`
+	ChangedAt      time.Time      `json:"changed_at" db:"changed_at"`
+}
+
 // Value implements driver.Valuer for CustomerStatus
 func (s CustomerStatus) Value() (driver.Value, error) {
 	return string(s), nil
